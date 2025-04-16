@@ -1,0 +1,147 @@
+class VolSmileArbTrader:
+    def __init__(self, option_strikes, limits, z_threshold, history_window, best_only_entry, best_only_exit, min_profit_threshold=2.0):
+        self.option_strikes = option_strikes
+        self.limits = limits
+        self.underlying_symbol = "VOLCANIC_ROCK"
+        self.outlier_threshold = 0.04
+        self.entry_threshold = z_threshold
+        self.history_window = history_window
+        self.best_only_entry = best_only_entry
+        self.best_only_exit = best_only_exit
+        self.min_profit_threshold = min_profit_threshold
+
+    def black_scholes_call(self, S, K, T, sigma):
+        d1 = (log(S / K) + 0.5 * sigma**2 * T) / (sigma * sqrt(T))
+        d2 = d1 - sigma * sqrt(T)
+        return S * NormalDist().cdf(d1) - K * NormalDist().cdf(d2)
+
+    def implied_volatility(self, price, S, K, T, tol=1e-8, max_iter=100):
+        low, high = 0.01, 2.0
+        for _ in range(max_iter):
+            mid = (low + high) / 2
+            guess = self.black_scholes_call(S, K, T, mid)
+            if abs(guess - price) < tol:
+                return mid
+            if guess > price:
+                high = mid
+            else:
+                low = mid
+        return mid
+
+    def delta(self, S, K, T, sigma):
+        d1 = (log(S / K) + 0.5 * sigma**2 * T) / (sigma * sqrt(T))
+        return NormalDist().cdf(d1)
+
+    def get_orderbook(self, symbol, is_buy):
+        od = self.order_depths[symbol]
+        return od.sell_orders if is_buy else od.buy_orders
+
+    def get_volume_at_best(self, symbol, is_buy):
+        book = self.get_orderbook(symbol, is_buy)
+        if not book:
+            return 0
+        best_price = min(book) if is_buy else max(book)
+        return -book[best_price] if is_buy else book[best_price]
+
+    def consume_best(self, symbol, size, is_buy, orders):
+        book = self.get_orderbook(symbol, is_buy)
+        if not book:
+            return 0
+        price = min(book) if is_buy else max(book)
+        available = -book[price] if is_buy else book[price]
+        volume = min(size, available)
+        if volume <= 0:
+            return 0
+        orders[symbol].append(Order(symbol, price, volume if is_buy else -volume))
+        book[price] += volume if is_buy else -volume
+        self.position[symbol] += volume if is_buy else -volume
+        return volume
+
+    def get_max_position_volume(self, symbol, is_buy):
+        current_pos = self.position[symbol]
+        limit = self.limits[symbol]
+        return max(0, (limit - current_pos) if is_buy else (limit + current_pos))
+
+    def generate_orders(self, state, trader_data):
+        self.position = defaultdict(int, state.position)
+        self.order_depths = deepcopy(state.order_depths)
+        orders = defaultdict(list)
+
+        underlying = self.underlying_symbol
+        spot = get_mid_price(state, underlying, 'mid_price', 0)
+        TTE = max(0.01, (5 - state.timestamp / 1e6) / 250)
+
+        trader_data.setdefault("coeff_history", [])
+        m_list, v_list, meta = [], [], []
+
+        for symbol, K in self.option_strikes.items():
+            if symbol not in self.order_depths:
+                continue
+            option_mid = get_mid_price(state, symbol, 'mid_price', 0)
+            if option_mid <= 0:
+                continue
+            iv = self.implied_volatility(option_mid, spot, K, TTE)
+            m = log(K / spot) / sqrt(TTE)
+            m_list.append(m)
+            v_list.append(iv)
+            meta.append((symbol, K, iv, m, option_mid))
+
+        if len(m_list) < 3:
+            return {}
+
+        if len(trader_data["coeff_history"]) < self.history_window:
+            coeffs = np.polyfit(m_list, v_list, deg=2)
+            trader_data["coeff_history"].append(coeffs.tolist())
+            return {}
+
+        coeff_array = np.array(trader_data["coeff_history"][-self.history_window:])
+        avg_coeffs = np.mean(coeff_array, axis=0)
+        fit_avg = np.poly1d(avg_coeffs)
+
+        filtered_m, filtered_v = [], []
+        for _, _, iv, m, _ in meta:
+            if abs(iv - fit_avg(m)) < self.outlier_threshold:
+                filtered_m.append(m)
+                filtered_v.append(iv)
+        if len(filtered_m) >= 3:
+            trader_data["coeff_history"].append(np.polyfit(filtered_m, filtered_v, 2).tolist())
+
+        # 套利配对交易逻辑
+        sorted_meta = sorted(meta, key=lambda x: x[2] - fit_avg(x[3]))  # iv - fitted_iv
+        sym_low, K_low, iv_low, m_low, price_low = sorted_meta[0]
+        sym_high, K_high, iv_high, m_high, price_high = sorted_meta[-1]
+
+        pred_iv_low = fit_avg(m_low)
+        pred_iv_high = fit_avg(m_high)
+
+        price_diff_low = min(self.order_depths[sym_low].sell_orders) - price_low
+        price_diff_high = price_high - max(self.order_depths[sym_high].buy_orders)
+        expected_profit = price_diff_low + price_diff_high
+
+        if expected_profit >= self.min_profit_threshold:
+            delta_low = self.delta(spot, K_low, TTE, iv_low)
+            delta_high = self.delta(spot, K_high, TTE, iv_high)
+            avg_delta = (abs(delta_low) + abs(delta_high)) / 2
+
+            vol_buy_low = self.get_volume_at_best(sym_low, True)
+            vol_sell_high = self.get_volume_at_best(sym_high, False)
+            vol_hedge_buy = self.get_volume_at_best(underlying, True)
+            vol_hedge_sell = self.get_volume_at_best(underlying, False)
+
+            max_volume = min(
+                vol_buy_low,
+                vol_sell_high,
+                self.get_max_position_volume(sym_low, True),
+                self.get_max_position_volume(sym_high, False),
+                int(vol_hedge_sell / avg_delta),
+                self.get_max_position_volume(underlying, False)
+            )
+
+            if max_volume > 0:
+                self.consume_best(sym_low, max_volume, True, orders)
+                self.consume_best(underlying, round(avg_delta * max_volume), False, orders)
+
+                self.consume_best(sym_high, max_volume, False, orders)
+                self.consume_best(underlying, round(avg_delta * max_volume), True, orders)
+
+        return dict(orders)

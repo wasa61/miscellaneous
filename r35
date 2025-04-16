@@ -1,0 +1,393 @@
+class VolSmileArbTrader:
+    def __init__(self, option_strikes, limits, z_threshold, history_window, best_only_entry, best_only_exit,
+                 min_profit_threshold=2.0, clear_profit_threshold=1.5):
+        self.option_strikes = option_strikes
+        self.limits = limits
+        self.underlying_symbol = "VOLCANIC_ROCK"
+        self.outlier_threshold = 0.04
+        self.entry_threshold = z_threshold
+        self.history_window = history_window
+        self.best_only_entry = best_only_entry
+        self.best_only_exit = best_only_exit
+        self.min_profit_threshold = min_profit_threshold
+        self.clear_profit_threshold = clear_profit_threshold
+
+    def black_scholes_call(self, S, K, T, sigma):
+        d1 = (log(S / K) + 0.5 * sigma ** 2 * T) / (sigma * sqrt(T))
+        d2 = d1 - sigma * sqrt(T)
+        return S * NormalDist().cdf(d1) - K * NormalDist().cdf(d2)
+
+    def implied_volatility(self, price, S, K, T, tol=1e-8, max_iter=100):
+        low, high = 0.01, 2.0
+        for _ in range(max_iter):
+            mid = (low + high) / 2
+            guess = self.black_scholes_call(S, K, T, mid)
+            if abs(guess - price) < tol:
+                return mid
+            if guess > price:
+                high = mid
+            else:
+                low = mid
+        return mid
+
+    def delta(self, S, K, T, sigma):
+        d1 = (log(S / K) + 0.5 * sigma ** 2 * T) / (sigma * sqrt(T))
+        return NormalDist().cdf(d1)
+
+    def get_orderbook(self, symbol, is_buy):
+        od = self.order_depths[symbol]
+        return od.sell_orders if is_buy else od.buy_orders
+
+    def consume_best(self, symbol, size, is_buy, orders):
+        book = self.get_orderbook(symbol, is_buy)
+        if not book:
+            return 0
+        price = min(book) if is_buy else max(book)
+        available = -book[price] if is_buy else book[price]
+        volume = min(size, available)
+        if volume <= 0:
+            return 0
+        orders[symbol].append(Order(symbol, price, volume if is_buy else -volume))
+        book[price] += volume if is_buy else -volume
+        self.position[symbol] += volume if is_buy else -volume
+        return volume
+
+    def get_max_position_volume(self, symbol, is_buy):
+        current_pos = self.position[symbol]
+        limit = self.limits[symbol]
+        return max(0, (limit - current_pos) if is_buy else (limit + current_pos))
+
+    def generate_orders(self, state, trader_data):
+        self.position = defaultdict(int, state.position)
+        self.order_depths = deepcopy(state.order_depths)
+        orders = defaultdict(list)
+
+        underlying = self.underlying_symbol
+        spot = get_mid_price(state, underlying, 'mid_price', 0)
+        TTE = max(0.01, (5 - state.timestamp / 1e6) / 250)
+
+        trader_data.setdefault("coeff_history", [])
+        trader_data.setdefault("pair_trade_log", [])
+        trader_data.setdefault("clear_trade_log", [])
+        trader_data.setdefault("hedge_log", [])
+
+        m_list, v_list, meta = [], [], []
+
+        for symbol, K in self.option_strikes.items():
+            if symbol not in self.order_depths:
+                continue
+            option_mid = get_mid_price(state, symbol, 'mid_price', 0)
+            if option_mid <= 0:
+                continue
+            iv = self.implied_volatility(option_mid, spot, K, TTE)
+            m = log(K / spot) / sqrt(TTE)
+            m_list.append(m)
+            v_list.append(iv)
+            meta.append((symbol, K, iv, m, option_mid))
+
+        if len(m_list) < 3:
+            return {}
+
+        if len(trader_data["coeff_history"]) < self.history_window:
+            coeffs = np.polyfit(m_list, v_list, deg=2)
+            trader_data["coeff_history"].append(coeffs.tolist())
+            return {}
+
+        coeff_array = np.array(trader_data["coeff_history"][-self.history_window:])
+        avg_coeffs = np.mean(coeff_array, axis=0)
+        fit_avg = np.poly1d(avg_coeffs)
+
+        filtered_m, filtered_v = [], []
+        for _, _, iv, m, _ in meta:
+            if abs(iv - fit_avg(m)) < self.outlier_threshold:
+                filtered_m.append(m)
+                filtered_v.append(iv)
+        if len(filtered_m) >= 3:
+            trader_data["coeff_history"].append(np.polyfit(filtered_m, filtered_v, 2).tolist())
+
+        total_delta = 0.0
+
+        for symbol, K, iv, m, option_mid in meta:
+            fit_iv = fit_avg(m)
+            theo_price = self.black_scholes_call(spot, K, TTE, fit_iv)
+            delta_val = self.delta(spot, K, TTE, fit_iv)
+            pos = self.position[symbol]
+            total_delta += delta_val * pos
+
+            orderbook = self.order_depths[symbol]
+
+            # 吃单套利逻辑
+            try:
+                best_ask = min(orderbook.sell_orders)
+                best_bid = max(orderbook.buy_orders)
+            except:
+                continue
+
+            if abs(iv - fit_iv) >= self.entry_threshold:
+                is_underpriced = iv < fit_iv
+                is_buy = is_underpriced
+                best_price = best_ask if is_buy else best_bid
+                expected_profit = (theo_price - best_price) if is_buy else (best_price - theo_price)
+
+                if expected_profit >= self.min_profit_threshold:
+                    available = -orderbook.sell_orders[best_ask] if is_buy else orderbook.buy_orders[best_bid]
+                    max_volume = self.get_max_position_volume(symbol, is_buy)
+                    trade_volume = min(available, max_volume)
+                    if trade_volume > 0:
+                        self.consume_best(symbol, trade_volume, is_buy, orders)
+                        trader_data["pair_trade_log"].append({
+                            "timestamp": state.timestamp,
+                            "symbol": symbol,
+                            "side": "buy" if is_buy else "sell",
+                            "volume": trade_volume,
+                            "profit_est": expected_profit
+                        })
+
+            # 清仓逻辑
+            if pos != 0:
+                is_buy = pos < 0
+                book = self.get_orderbook(symbol, is_buy)
+                if not book:
+                    continue
+                best_price = min(book) if is_buy else max(book)
+                expected_profit = (theo_price - best_price) if is_buy else (best_price - theo_price)
+                if expected_profit >= self.clear_profit_threshold:
+                    available = abs(book[best_price])
+                    max_volume = self.get_max_position_volume(symbol, is_buy)
+                    trade_volume = min(abs(pos), available, max_volume)
+                    if trade_volume > 0:
+                        self.consume_best(symbol, trade_volume, is_buy, orders)
+                        trader_data["clear_trade_log"].append({
+                            "timestamp": state.timestamp,
+                            "symbol": symbol,
+                            "side": "buy" if is_buy else "sell",
+                            "volume": trade_volume,
+                            "profit_est": expected_profit
+                        })
+
+        # delta hedge
+        hedge_symbol = self.underlying_symbol
+        hedge_delta = -round(total_delta)
+
+        if hedge_delta != 0 and hedge_symbol in self.order_depths:
+            hedge_buy = hedge_delta > 0
+            hedge_book = self.get_orderbook(hedge_symbol, hedge_buy)
+            if hedge_book:
+                best_price = min(hedge_book) if hedge_buy else max(hedge_book)
+                available = abs(hedge_book[best_price])
+                max_vol = self.get_max_position_volume(hedge_symbol, hedge_buy)
+                trade_volume = min(abs(hedge_delta), available, max_vol)
+                if trade_volume > 0:
+                    self.consume_best(hedge_symbol, trade_volume, hedge_buy, orders)
+                    trader_data["hedge_log"].append({
+                        "timestamp": state.timestamp,
+                        "delta_to_hedge": hedge_delta,
+                        "executed_volume": trade_volume,
+                        "side": "buy" if hedge_buy else "sell"
+                    })
+
+        return dict(orders)
+
+
+
+
+
+
+
+class VolSmileArbTrader:
+    def __init__(self, option_strikes, limits, z_threshold, history_window, best_only_entry, best_only_exit,
+                 min_profit_threshold=2.0, clear_profit_threshold=1.5):
+        self.option_strikes = option_strikes
+        self.limits = limits
+        self.underlying_symbol = "VOLCANIC_ROCK"
+        self.outlier_threshold = 0.04
+        self.entry_threshold = z_threshold
+        self.history_window = history_window
+        self.best_only_entry = best_only_entry
+        self.best_only_exit = best_only_exit
+        self.min_profit_threshold = min_profit_threshold
+        self.clear_profit_threshold = clear_profit_threshold
+
+    def black_scholes_call(self, S, K, T, sigma):
+        d1 = (log(S / K) + 0.5 * sigma ** 2 * T) / (sigma * sqrt(T))
+        d2 = d1 - sigma * sqrt(T)
+        return S * NormalDist().cdf(d1) - K * NormalDist().cdf(d2)
+
+    def implied_volatility(self, price, S, K, T, tol=1e-8, max_iter=100):
+        low, high = 0.01, 2.0
+        for _ in range(max_iter):
+            mid = (low + high) / 2
+            guess = self.black_scholes_call(S, K, T, mid)
+            if abs(guess - price) < tol:
+                return mid
+            if guess > price:
+                high = mid
+            else:
+                low = mid
+        return mid
+
+    def delta(self, S, K, T, sigma):
+        d1 = (log(S / K) + 0.5 * sigma ** 2 * T) / (sigma * sqrt(T))
+        return NormalDist().cdf(d1)
+
+    def get_orderbook(self, symbol, is_buy):
+        od = self.order_depths[symbol]
+        return od.sell_orders if is_buy else od.buy_orders
+
+    def get_volume_at_best(self, symbol, is_buy):
+        book = self.get_orderbook(symbol, is_buy)
+        if not book:
+            return 0
+        best_price = min(book) if is_buy else max(book)
+        return -book[best_price] if is_buy else book[best_price]
+
+    def consume_best(self, symbol, size, is_buy, orders):
+        book = self.get_orderbook(symbol, is_buy)
+        if not book:
+            return 0
+        price = min(book) if is_buy else max(book)
+        available = -book[price] if is_buy else book[price]
+        volume = min(size, available)
+        if volume <= 0:
+            return 0
+        orders[symbol].append(Order(symbol, price, volume if is_buy else -volume))
+        book[price] += volume if is_buy else -volume
+        self.position[symbol] += volume if is_buy else -volume
+        return volume
+
+    def get_max_position_volume(self, symbol, is_buy):
+        current_pos = self.position[symbol]
+        limit = self.limits[symbol]
+        return max(0, (limit - current_pos) if is_buy else (limit + current_pos))
+
+    def generate_orders(self, state, trader_data):
+        self.position = defaultdict(int, state.position)
+        self.order_depths = deepcopy(state.order_depths)
+        orders = defaultdict(list)
+
+        underlying = self.underlying_symbol
+        spot = get_mid_price(state, underlying, 'mid_price', 0)
+        TTE = max(0.01, (5 - state.timestamp / 1e6) / 250)
+
+        trader_data.setdefault("coeff_history", [])
+        trader_data.setdefault("pair_trade_log", [])
+        trader_data.setdefault("clear_trade_log", [])
+        trader_data.setdefault("hedge_log", [])
+
+        m_list, v_list, meta = [], [], []
+
+        for symbol, K in self.option_strikes.items():
+            if symbol not in self.order_depths:
+                continue
+            option_mid = get_mid_price(state, symbol, 'mid_price', 0)
+            if option_mid <= 0:
+                continue
+            iv = self.implied_volatility(option_mid, spot, K, TTE)
+            m = log(K / spot) / sqrt(TTE)
+            m_list.append(m)
+            v_list.append(iv)
+            meta.append((symbol, K, iv, m, option_mid))
+
+        if len(m_list) < 3:
+            return {}
+
+        if len(trader_data["coeff_history"]) < self.history_window:
+            coeffs = np.polyfit(m_list, v_list, deg=2)
+            trader_data["coeff_history"].append(coeffs.tolist())
+            return {}
+
+        coeff_array = np.array(trader_data["coeff_history"][-self.history_window:])
+        avg_coeffs = np.mean(coeff_array, axis=0)
+        fit_avg = np.poly1d(avg_coeffs)
+
+        filtered_m, filtered_v = [], []
+        for _, _, iv, m, _ in meta:
+            if abs(iv - fit_avg(m)) < self.outlier_threshold:
+                filtered_m.append(m)
+                filtered_v.append(iv)
+        if len(filtered_m) >= 3:
+            trader_data["coeff_history"].append(np.polyfit(filtered_m, filtered_v, 2).tolist())
+
+        total_delta = 0.0
+
+        for symbol, K, iv, m, option_mid in meta:
+            fit_iv = fit_avg(m)
+            rel_diff = iv - fit_iv
+            delta_val = self.delta(spot, K, TTE, iv)
+            pos = self.position[symbol]
+            total_delta += delta_val * pos
+
+            # 1. 吃单套利
+            try:
+                best_ask = min(self.order_depths[symbol].sell_orders)
+                best_bid = max(self.order_depths[symbol].buy_orders)
+            except:
+                continue
+
+            if abs(rel_diff) >= self.entry_threshold:
+                is_underpriced = rel_diff < 0
+                is_buy = is_underpriced
+                best_price = best_ask if is_buy else best_bid
+                expected_profit = abs(option_mid - best_price)
+
+                if expected_profit >= self.min_profit_threshold:
+                    volume = abs(self.order_depths[symbol].sell_orders[best_ask]) if is_buy else \
+                             self.order_depths[symbol].buy_orders[best_bid]
+                    max_vol = self.get_max_position_volume(symbol, is_buy)
+                    trade_volume = min(volume, max_vol)
+                    if trade_volume > 0:
+                        self.consume_best(symbol, trade_volume, is_buy, orders)
+                        trader_data["pair_trade_log"].append({
+                            "timestamp": state.timestamp,
+                            "symbol": symbol,
+                            "side": "buy" if is_buy else "sell",
+                            "volume": trade_volume,
+                            "profit_est": expected_profit
+                        })
+
+            # 2. 清仓逻辑
+            if pos != 0:
+                is_buy = pos < 0
+                orderbook = self.get_orderbook(symbol, is_buy)
+                if not orderbook:
+                    continue
+                best_price = min(orderbook) if is_buy else max(orderbook)
+                mid_price = get_mid_price(state, symbol, 'mid_price', 0)
+                expected_profit = abs(best_price - mid_price)
+                if expected_profit >= self.clear_profit_threshold:
+                    available = abs(orderbook[best_price])
+                    max_vol = self.get_max_position_volume(symbol, is_buy)
+                    trade_volume = min(available, abs(pos), max_vol)
+                    if trade_volume > 0:
+                        self.consume_best(symbol, trade_volume, is_buy, orders)
+                        trader_data["clear_trade_log"].append({
+                            "timestamp": state.timestamp,
+                            "symbol": symbol,
+                            "side": "buy" if is_buy else "sell",
+                            "volume": trade_volume,
+                            "profit_est": expected_profit
+                        })
+
+        # 3. delta hedge
+        hedge_symbol = self.underlying_symbol
+        hedge_pos = self.position[hedge_symbol]
+        hedge_delta = -round(total_delta)
+
+        if hedge_delta != 0 and hedge_symbol in self.order_depths:
+            hedge_buy = hedge_delta > 0
+            hedge_book = self.get_orderbook(hedge_symbol, hedge_buy)
+            if hedge_book:
+                best_price = min(hedge_book) if hedge_buy else max(hedge_book)
+                available = abs(hedge_book[best_price])
+                max_vol = self.get_max_position_volume(hedge_symbol, hedge_buy)
+                trade_volume = min(abs(hedge_delta), available, max_vol)
+                if trade_volume > 0:
+                    self.consume_best(hedge_symbol, trade_volume, hedge_buy, orders)
+                    trader_data["hedge_log"].append({
+                        "timestamp": state.timestamp,
+                        "delta_to_hedge": hedge_delta,
+                        "executed_volume": trade_volume,
+                        "side": "buy" if hedge_buy else "sell"
+                    })
+
+        return dict(orders)
